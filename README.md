@@ -80,7 +80,7 @@ Rotating mode: every line is identical. Each request gets a new Tor exit IP.
 http://username:password@127.0.0.1:8080
 ```
 
-Sticky mode: each line has a unique session ID baked into the username. The proxy binds that session to a dedicated circuit, so every request using that line exits through the same IP.
+Sticky mode: each line has a unique session ID and time (in minutes) that that session should last baked into the username. The proxy binds that session to a dedicated circuit, so every request using that line exits through the same IP.
 
 ```
 http://username-session-a1b2c3-time-30:password@127.0.0.1:8080
