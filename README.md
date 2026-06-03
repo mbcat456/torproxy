@@ -12,7 +12,7 @@ The proxy pool maintains hundreds of independent circuits, each with its own TLS
 
 ```
 pip install cryptography psutil
-git clone https://github.com/mbcat456/torproxy
+git clone https://github.com/mbcat456/tor-proxy
 cd torproxy
 ```
 
