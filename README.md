@@ -1,6 +1,6 @@
 # TorProxy
 
-A pure Python Tor HTTP forward proxy that builds circuits through the Tor network and exposes them as an HTTP proxy on your machine. Every request exits through a different Tor circuit, giving each connection a fresh IP address (on a best effort basis when using rotating proxy mode, as the tor exit ip pool is of around 1.1k-1.2k ip addresses).
+A lightweight pure Python Tor HTTP forward proxy that builds circuits through the Tor network and exposes them as an HTTP proxy on your machine. Every request exits through a different Tor circuit, giving each connection a fresh IP address (on a best effort basis when using rotating proxy mode, as the tor exit ip pool is of around 1.1k-1.2k ip addresses).
 
 ## How it works
 
