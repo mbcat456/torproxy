@@ -145,19 +145,6 @@ torproxy/
       state.py        State file reader and writer for the background proxy process
       terminal.py     Windows ANSI escape code enable
       torproxy_.py    Full screen heads up display terminal interface
-  tests/
-    test_circuit.py
-    test_cli.py
-    test_crypto.py
-    test_http_proxy_features.py
-    test_pool.py
-    test_proxy.py
-  scripts/
-    check_pool.py
-    pool_capacity_test.py
-    smoke_large.py
-    smoke_live.py
-    stability_monitor.py
   pyproject.toml
   requirements.txt
   README.md
@@ -172,16 +159,15 @@ Python 3.10 or later. The only required packages are `cryptography` (for X25519 
 
 ## Development
 
-Install the optional development tools:
+Install the optional static analysis tool:
 
 ```
-python -m pip install pytest ruff
+python -m pip install ruff
 ```
 
-Run the test suite and static checks from the repository root:
+Run the static checks from the repository root:
 
 ```
-python -m pytest -q
-python -m ruff check torproxy tests scripts
-python -m ruff format --check torproxy tests scripts
+python -m ruff check torproxy
+python -m ruff format --check torproxy
 ```
