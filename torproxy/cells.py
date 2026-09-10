@@ -39,12 +39,24 @@ SERVER_STR = b"Server"
 
 MIN_LINK_PROTO_FOR_WIDE_CIRC_IDS = 4
 
+STREAM_ID_FIRST = 0x8001
+STREAM_ID_MASK = 0xFFFF
+CIRCUIT_ID_FIRST_NARROW = 0x8001
+CIRCUIT_ID_FIRST_WIDE = 0x80000001
+CIRCUIT_ID_MASK_NARROW = 0xFFFF
+CIRCUIT_ID_MASK_WIDE = 0xFFFFFFFF
+
 CIRCWINDOW_START = 1000
+CIRCWINDOW_INCREMENT = 100
 STREAM_TIMEOUT = 60
 STREAM_QUEUE_MAX = 512
 STREAM_WINDOW_START = 500
+STREAMWINDOW_INCREMENT = 50
 DEFAULT_MAX_CLIENTS = 5000
 DEFAULT_MAX_REQUEST_BYTES = 2 * 1024 * 1024
+
+BEGIN_FLAG_IPV4_OK = 0x01
+BEGIN_FLAG_IPV6_OK = 0x02
 
 
 @dataclass
@@ -70,8 +82,12 @@ def pack_fixed_cell(circ_id: int, command: int, payload: bytes, wide: bool) -> b
         return struct.pack("!HB", circ_id & 0xFFFF, command) + pad
 
 
-def build_relay_payload(relay_cmd: int, stream_id: int, data: bytes,
-                        digest_bytes: bytes = b"\x00\x00\x00\x00") -> bytes:
+def build_relay_payload(
+    relay_cmd: int,
+    stream_id: int,
+    data: bytes,
+    digest_bytes: bytes = b"\x00\x00\x00\x00",
+) -> bytes:
     length = min(len(data), RELAY_PAYLOAD_SIZE)
     header = struct.pack("!BHH4sH", relay_cmd, 0, stream_id, digest_bytes, length)
     payload = header + data[:RELAY_PAYLOAD_SIZE]

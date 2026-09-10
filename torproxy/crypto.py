@@ -1,7 +1,6 @@
 import hashlib
 import hmac as _hmac
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
@@ -10,7 +9,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from .cells import CPATH_KEY_MATERIAL_LEN, NTOR_ONIONSKIN_LEN, NTOR_REPLY_LEN, NTOR_PROTOID, SERVER_STR
+from .cells import CPATH_KEY_MATERIAL_LEN, NTOR_PROTOID, NTOR_REPLY_LEN, SERVER_STR
 
 
 def hmac_sha256(key: bytes, msg: bytes) -> bytes:
@@ -42,18 +41,20 @@ class NtorState:
     pubkey_X: bytes
 
 
-def ntor_create(router_id: bytes, router_key: bytes) -> Tuple[NtorState, bytes]:
+def ntor_create(router_id: bytes, router_key: bytes) -> tuple[NtorState, bytes]:
     priv = X25519PrivateKey.generate()
     pubkey_X = priv.public_key().public_bytes_raw()
     seckey_x = priv.private_bytes_raw()
-    state = NtorState(router_id=router_id, pubkey_B=router_key,
-                      seckey_x=seckey_x, pubkey_X=pubkey_X)
+    state = NtorState(
+        router_id=router_id, pubkey_B=router_key, seckey_x=seckey_x, pubkey_X=pubkey_X
+    )
     skin = router_id + router_key + pubkey_X
     return state, skin
 
 
-def ntor_client_handshake(state: NtorState, reply: bytes,
-                          key_out_len: int = CPATH_KEY_MATERIAL_LEN) -> Optional[bytes]:
+def ntor_client_handshake(
+    state: NtorState, reply: bytes, key_out_len: int = CPATH_KEY_MATERIAL_LEN
+) -> bytes | None:
     if len(reply) != NTOR_REPLY_LEN:
         return None
     pubkey_Y = reply[:32]
@@ -67,12 +68,26 @@ def ntor_client_handshake(state: NtorState, reply: bytes,
     if exp_Yx == b"\x00" * 32 or exp_Bx == b"\x00" * 32:
         return None
 
-    secret_input = (exp_Yx + exp_Bx + state.router_id +
-                    state.pubkey_B + state.pubkey_X + pubkey_Y + NTOR_PROTOID)
+    secret_input = (
+        exp_Yx
+        + exp_Bx
+        + state.router_id
+        + state.pubkey_B
+        + state.pubkey_X
+        + pubkey_Y
+        + NTOR_PROTOID
+    )
 
     verify = h_tweak(NTOR_PROTOID + b":verify", secret_input)
-    auth_input = (verify + state.router_id + state.pubkey_B + pubkey_Y +
-                  state.pubkey_X + NTOR_PROTOID + SERVER_STR)
+    auth_input = (
+        verify
+        + state.router_id
+        + state.pubkey_B
+        + pubkey_Y
+        + state.pubkey_X
+        + NTOR_PROTOID
+        + SERVER_STR
+    )
     auth_calc = h_tweak(NTOR_PROTOID + b":mac", auth_input)
     if auth_calc != auth_rcvd:
         return None
@@ -86,17 +101,18 @@ def ntor_client_handshake(state: NtorState, reply: bytes,
 
 
 class RelayCrypto:
-
     def __init__(self, key_data: bytes):
         assert len(key_data) == CPATH_KEY_MATERIAL_LEN
         self.f_digest = hashlib.sha1(key_data[:20])
         self.b_digest = hashlib.sha1(key_data[20:40])
         f_key = key_data[40:56]
         b_key = key_data[56:72]
-        self._f_cipher = Cipher(algorithms.AES(f_key), modes.CTR(b"\x00" * 16),
-                                backend=default_backend())
-        self._b_cipher = Cipher(algorithms.AES(b_key), modes.CTR(b"\x00" * 16),
-                                backend=default_backend())
+        self._f_cipher = Cipher(
+            algorithms.AES(f_key), modes.CTR(b"\x00" * 16), backend=default_backend()
+        )
+        self._b_cipher = Cipher(
+            algorithms.AES(b_key), modes.CTR(b"\x00" * 16), backend=default_backend()
+        )
         self._f_enc = self._f_cipher.encryptor()
         self._b_enc = self._b_cipher.encryptor()
 
@@ -108,10 +124,11 @@ class RelayCrypto:
 
     def set_forward_digest(self, payload: bytes) -> bytes:
         self.f_digest.update(payload)
-        return self.f_digest.digest()[:4]
+        return self.f_digest.digest()
 
     def check_backward_digest(self, payload: bytes) -> bool:
         from .cells import RELAY_HEADER_SIZE
+
         rh = payload[:RELAY_HEADER_SIZE]
         received = rh[5:9]
         test_rh = rh[:5] + b"\x00\x00\x00\x00" + rh[9:]

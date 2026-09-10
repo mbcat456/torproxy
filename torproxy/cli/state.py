@@ -4,7 +4,7 @@ import os
 import tempfile
 
 
-def _state_file_path() -> str:
+def state_file_path() -> str:
     return os.path.join(tempfile.gettempdir(), "torproxy_state.json")
 
 
@@ -33,15 +33,26 @@ def write_state_file(
         "bytes_up": bytes_up,
         "bytes_down": bytes_down,
     }
-    path = _state_file_path()
-    with open(path, "w", encoding="utf-8") as f:
+    path = state_file_path()
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp_path, path)
     return path
 
 
 def delete_state_file() -> None:
-    path = _state_file_path()
+    path = state_file_path()
     try:
         os.remove(path)
     except OSError:
         pass
+
+
+def read_state_file() -> dict | None:
+    try:
+        with open(state_file_path()) as stream:
+            data = json.load(stream)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None

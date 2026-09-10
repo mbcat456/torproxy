@@ -1,8 +1,6 @@
 import asyncio
 import ssl
 import struct
-import time
-from typing import Optional
 
 from .cells import (
     CELL_AUTH_CHALLENGE,
@@ -21,17 +19,20 @@ from .cells import (
 )
 from .log import log
 
+MAX_VARIABLE_CELL_SIZE = 1024 * 1024
+
 
 class TorConnection:
-
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
-        self.reader: Optional[asyncio.StreamReader] = None
-        self.writer: Optional[asyncio.StreamWriter] = None
+        self.reader: asyncio.StreamReader | None = None
+        self.writer: asyncio.StreamWriter | None = None
         self.link_proto = 0
         self._recv_buf = b""
         self._read_lock = asyncio.Lock()
+        self._cell_queues: dict = {}
+        self._router_task: asyncio.Task | None = None
 
     @property
     def wide(self) -> bool:
@@ -44,8 +45,8 @@ class TorConnection:
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         log.info("Connecting TLS to %s:%d", self.host, self.port)
         self.reader, self.writer = await asyncio.wait_for(
-            asyncio.open_connection(self.host, self.port, ssl=ctx),
-            timeout=timeout)
+            asyncio.open_connection(self.host, self.port, ssl=ctx), timeout=timeout
+        )
         log.info("TLS connected to %s:%d", self.host, self.port)
 
     async def _read_exactly(self, n: int) -> bytes:
@@ -84,17 +85,61 @@ class TorConnection:
             if is_variable_length_cell(command, link):
                 len_bytes = await self._read_exactly(2)
                 length = struct.unpack("!H", len_bytes)[0]
+                if length > MAX_VARIABLE_CELL_SIZE:
+                    raise ConnectionError(
+                        f"Oversized variable cell from relay: {length} bytes"
+                    )
                 payload = await self._read_exactly(length)
-                return Cell(circ_id=circ_id, command=command, payload=payload, is_fixed=False)
+                return Cell(
+                    circ_id=circ_id, command=command, payload=payload, is_fixed=False
+                )
             else:
                 payload = await self._read_exactly(CELL_PAYLOAD_SIZE)
-                return Cell(circ_id=circ_id, command=command, payload=payload, is_fixed=True)
+                return Cell(
+                    circ_id=circ_id, command=command, payload=payload, is_fixed=True
+                )
+
+    def start_cell_router(self) -> None:
+        if self._router_task is None or self._router_task.done():
+            self._router_task = asyncio.create_task(self._router_loop())
+
+    def register_circuit(self, circ_id: int) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue()
+        self._cell_queues[circ_id] = queue
+        return queue
+
+    def unregister_circuit(self, circ_id: int) -> None:
+        self._cell_queues.pop(circ_id, None)
+
+    async def _router_loop(self) -> None:
+        try:
+            while True:
+                cell = await self.recv_cell()
+                queue = self._cell_queues.get(cell.circ_id)
+                if queue is not None:
+                    await queue.put(cell)
+        except asyncio.CancelledError:
+            raise
+        except (ConnectionError, OSError):
+            pass
+        except Exception:
+            pass
+        finally:
+            for queue in list(self._cell_queues.values()):
+                queue.put_nowait(ConnectionError("Tor connection closed"))
+            self._cell_queues.clear()
 
     async def close(self) -> None:
+        if self._router_task and not self._router_task.done():
+            self._router_task.cancel()
+            try:
+                await asyncio.gather(self._router_task, return_exceptions=True)
+            except Exception:
+                pass
         if self.writer:
             try:
                 self.writer.close()
-                await self.writer.wait_closed()
+                await asyncio.wait_for(self.writer.wait_closed(), timeout=5)
             except Exception:
                 pass
             self.writer = None
@@ -109,10 +154,9 @@ async def tor_link_handshake(conn: TorConnection) -> None:
 
     ci_size = 2
     while True:
-        circ_id_bytes = await conn._read_exactly(ci_size)
+        await conn._read_exactly(ci_size)
         cmd_byte = await conn._read_exactly(1)
         command = cmd_byte[0]
-        circ_id = struct.unpack("!H", circ_id_bytes)[0]
         if command == CELL_VERSIONS:
             len_bytes = await conn._read_exactly(2)
             length = struct.unpack("!H", len_bytes)[0]
@@ -130,33 +174,41 @@ async def tor_link_handshake(conn: TorConnection) -> None:
 
     remote_versions = set()
     for i in range(0, length, 2):
-        v = struct.unpack("!H", resp[i:i+2])[0]
+        v = struct.unpack("!H", resp[i : i + 2])[0]
         remote_versions.add(v)
 
     common = sorted(set(vers) & remote_versions, reverse=True)
     if not common:
         raise RuntimeError("No common link protocol version")
     conn.link_proto = common[0]
-    log.info("Negotiated link protocol v%d (remote: %s)", conn.link_proto,
-             sorted(remote_versions))
+    log.info(
+        "Negotiated link protocol v%d (remote: %s)",
+        conn.link_proto,
+        sorted(remote_versions),
+    )
 
     cell = await conn.recv_cell()
+    while cell.command in (CELL_PADDING, CELL_VPADDING):
+        cell = await conn.recv_cell()
     if cell.command != CELL_CERTS:
         raise RuntimeError(f"Expected CERTS (129), got {cell.command}")
     log.debug("Received CERTS (%d bytes)", len(cell.payload))
 
     cell = await conn.recv_cell()
+    while cell.command in (CELL_PADDING, CELL_VPADDING):
+        cell = await conn.recv_cell()
     if cell.command != CELL_AUTH_CHALLENGE:
         raise RuntimeError(f"Expected AUTH_CHALLENGE (130), got {cell.command}")
     log.debug("Received AUTH_CHALLENGE (%d bytes)", len(cell.payload))
 
-    now = int(time.time()) & 0xFFFFFFFF
-    netinfo = struct.pack("!I", now)
+    netinfo = struct.pack("!I", 0)
     netinfo += b"\x04\x04\x00\x00\x00\x00"
     netinfo += b"\x00"
     await conn.send_fixed_cell(0, CELL_NETINFO, netinfo)
 
     cell = await conn.recv_cell()
+    while cell.command in (CELL_PADDING, CELL_VPADDING):
+        cell = await conn.recv_cell()
     if cell.command != CELL_NETINFO:
         raise RuntimeError(f"Expected NETINFO (8), got {cell.command}")
     log.info("Link handshake complete (proto v%d)", conn.link_proto)
