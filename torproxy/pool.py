@@ -1,5 +1,5 @@
 import asyncio
-import json
+import ipaddress
 import random
 import time
 
@@ -36,9 +36,41 @@ HEALTHY_STATUS_CODES = frozenset(
     }
 )
 MIN_HEALTHY_RESPONSE_BYTES = 50
+CHECKIP_HOST = "checkip.amazonaws.com"
 CHECKIP_REQUEST = (
     b"GET / HTTP/1.1\r\nHost: checkip.amazonaws.com\r\nConnection: close\r\n\r\n"
 )
+EXIT_PROBE_TIMEOUT_SECONDS = 6.0
+
+
+class DuplicateExitError(RuntimeError):
+    pass
+
+
+class ExitIpRegistry:
+    def __init__(self) -> None:
+        self._owners: dict[str, bytes] = {}
+
+    def claim(
+        self,
+        exit_ip: str,
+        identity: bytes,
+        previous_exit_ip: str | None = None,
+    ) -> bool:
+        owner = self._owners.get(exit_ip)
+        if owner is not None and owner != identity and exit_ip != previous_exit_ip:
+            return False
+        if previous_exit_ip is not None and previous_exit_ip != exit_ip:
+            self._owners.pop(previous_exit_ip, None)
+        self._owners[exit_ip] = identity
+        return True
+
+    def release(self, exit_ip: str, identity: bytes) -> None:
+        if self._owners.get(exit_ip) == identity:
+            del self._owners[exit_ip]
+
+    def __len__(self) -> int:
+        return len(self._owners)
 
 
 def initial_circuit_id(wide: bool) -> int:
@@ -69,6 +101,25 @@ def is_healthy_response(response: bytes) -> bool:
         and status_line[9:12] in HEALTHY_STATUS_CODES
         and len(response) > MIN_HEALTHY_RESPONSE_BYTES
     )
+
+
+async def probe_exit_ip(
+    circuit: TorCircuit, timeout: float = EXIT_PROBE_TIMEOUT_SECONDS
+) -> str | None:
+    try:
+        response = await asyncio.wait_for(
+            circuit.http_request(CHECKIP_HOST, 80, CHECKIP_REQUEST),
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    if not is_healthy_response(response):
+        return None
+    body = response.split(b"\r\n\r\n", 1)[-1].strip()
+    try:
+        return ipaddress.ip_address(body.decode("ascii")).compressed
+    except (UnicodeDecodeError, ValueError):
+        return None
 
 
 def select_least_loaded(circuits: list[TorCircuit]) -> TorCircuit:
@@ -127,6 +178,8 @@ class CircuitPool:
         self._circ_id_next = initial_circuit_id(conn.wide)
         self._lock = asyncio.Lock()
         self._shutting_down = False
+        self._observed_exits = ExitIpRegistry()
+        self._duplicate_exit_ids: set[bytes] = set()
 
     async def _reserve_circuit_id(self) -> int:
         async with self._lock:
@@ -144,17 +197,30 @@ class CircuitPool:
             if not self.middles or not self.exits:
                 break
             attempts += 1
-            middle = random.choice(self.middles)
-            while middle.identity == self.guard.identity and len(self.middles) > 1:
-                middle = random.choice(self.middles)
-            ex = random.choice(self.exits)
-            while (
-                ex.identity == self.guard.identity
-                or ex.identity == middle.identity
-                or ex.ip in used_ips
-                or ex.identity in used_ids
-            ) and len(self.exits) > 1:
-                ex = random.choice(self.exits)
+            exits = [
+                relay
+                for relay in self.exits
+                if relay.identity not in self._duplicate_exit_ids
+                and relay.identity != self.guard.identity
+                and relay.ip not in used_ips
+                and relay.identity not in used_ids
+            ]
+            if not exits:
+                exits = [
+                    relay
+                    for relay in self.exits
+                    if relay.identity not in self._duplicate_exit_ids
+                    and relay.identity != self.guard.identity
+                ]
+            if not exits:
+                break
+            ex = random.choice(exits)
+            middles = [
+                relay
+                for relay in self.middles
+                if relay.identity not in (self.guard.identity, ex.identity)
+            ]
+            middle = random.choice(middles or self.middles)
 
             try:
                 circ = await self._build_one(self.guard, middle, ex)
@@ -171,7 +237,13 @@ class CircuitPool:
             except Exception as exc:
                 log.warning("Circuit build attempt %d failed: %s", attempts, exc)
 
-        log.info("Built %d/%d circuits", len(self.circuits), self.num_circuits)
+        log.info(
+            "Built %d/%d circuits (%d observed exit IPs, %d duplicate relays rejected)",
+            len(self.circuits),
+            self.num_circuits,
+            len(self._observed_exits),
+            len(self._duplicate_exit_ids),
+        )
         if not self.circuits:
             raise RuntimeError("Failed to build any circuits")
 
@@ -183,9 +255,19 @@ class CircuitPool:
         circ = TorCircuit(self.conn, cid, cell_queue=queue)
         try:
             await asyncio.wait_for(circ.build(guard, middle, ex), timeout=25)
+            observed_ip = await probe_exit_ip(circ)
+            if observed_ip is None:
+                raise RuntimeError("Exit IP probe failed")
+            async with self._lock:
+                if not self._observed_exits.claim(observed_ip, ex.identity):
+                    self._duplicate_exit_ids.add(ex.identity)
+                    raise DuplicateExitError(
+                        f"Duplicate exit IP {observed_ip} from {ex.nickname}"
+                    )
+                circ._exit_ip = observed_ip
             return circ
         except (Exception, asyncio.CancelledError):
-            self.conn.unregister_circuit(cid)
+            await circ.close()
             raise
 
     def get_circuit(self) -> TorCircuit:
@@ -202,11 +284,16 @@ class CircuitPool:
             for c in self.circuits
             if c.conn and c.conn.writer and not c.conn.writer.is_closing()
         )
-        unique_ips = len(set(c.exit_info.ip for c in self.circuits if c.exit_info))
+        observed_ips = [
+            c._exit_ip for c in self.circuits if getattr(c, "_exit_ip", None)
+        ]
         return {
             "total": len(self.circuits),
             "alive": alive,
-            "unique_ips": unique_ips,
+            "unique_ips": len(set(observed_ips)),
+            "observed_ips": len(observed_ips),
+            "duplicate_observed_ips": len(observed_ips) - len(set(observed_ips)),
+            "duplicate_exit_relays": len(self._duplicate_exit_ids),
             "guard": self.guard.nickname,
         }
 
@@ -226,7 +313,8 @@ class CircuitPool:
         fresh = [
             r
             for r in self.exits
-            if r.identity != self.guard.identity
+            if r.identity not in self._duplicate_exit_ids
+            and r.identity != self.guard.identity
             and r.ip not in used_ips
             and r.identity not in used_ids
         ]
@@ -253,13 +341,20 @@ class CircuitPool:
             or circ.conn.writer.is_closing()
         ):
             return False
-        try:
-            response = await asyncio.wait_for(
-                circ.http_request("checkip.amazonaws.com", 80, CHECKIP_REQUEST), 10
-            )
-            return is_healthy_response(response)
-        except Exception:
+        observed_ip = await probe_exit_ip(circ, timeout=10.0)
+        if observed_ip is None:
             return False
+        identity = circ.exit_info.identity if circ.exit_info else b""
+        previous_exit_ip = getattr(circ, "_exit_ip", None)
+        async with self._lock:
+            if not self._observed_exits.claim(
+                observed_ip,
+                identity,
+                previous_exit_ip=previous_exit_ip,
+            ):
+                return False
+        circ._exit_ip = observed_ip
+        return True
 
     async def _replace_circuit(self, index: int, old_circ: TorCircuit) -> bool:
         ex = self._pick_exit()
@@ -275,9 +370,25 @@ class CircuitPool:
         try:
             await asyncio.wait_for(circ.build(self.guard, middle, ex), timeout=25)
         except (Exception, asyncio.CancelledError) as exc:
-            self.conn.unregister_circuit(cid)
+            await circ.close()
             if isinstance(exc, asyncio.CancelledError):
                 raise
+            return False
+        observed_ip = await probe_exit_ip(circ)
+        if observed_ip is None:
+            await circ.close()
+            return False
+        old_exit_ip = getattr(old_circ, "_exit_ip", None)
+        async with self._lock:
+            claimed = self._observed_exits.claim(
+                observed_ip, ex.identity, previous_exit_ip=old_exit_ip
+            )
+            if claimed:
+                circ._exit_ip = observed_ip
+            else:
+                self._duplicate_exit_ids.add(ex.identity)
+        if not claimed:
+            await circ.close()
             return False
         self.circuits[index] = circ
         asyncio.create_task(self._delayed_close(old_circ))
@@ -405,19 +516,6 @@ class CircuitPool:
 
 
 class DirectPool:
-    HEALTH_CHECKS = [
-        (
-            b"GET /ip HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n",
-            "httpbin.org",
-            80,
-        ),
-        (
-            CHECKIP_REQUEST,
-            "checkip.amazonaws.com",
-            80,
-        ),
-    ]
-
     def __init__(self, relays: list[RelayInfo], num_circuits: int = 10):
         self.all = relays
         self.num_circuits = num_circuits
@@ -430,6 +528,8 @@ class DirectPool:
         self._rebuilding: set[int] = set()
         self._shutting_down: bool = False
         self._lock = asyncio.Lock()
+        self._observed_exits = ExitIpRegistry()
+        self._duplicate_exit_ids: set[bytes] = set()
 
     def _entry_dead(self, ident: bytes) -> bool:
         until = self._dead_until.get(ident)
@@ -530,12 +630,17 @@ class DirectPool:
             r
             for r in others
             if r.can_exit()
+            and r.identity not in self._duplicate_exit_ids
             and r.ip not in self._used_ips
             and r.identity not in self._used_ids
         ]
         if fresh:
             return random.choice(fresh)
-        exits = [r for r in others if r.can_exit()]
+        exits = [
+            r
+            for r in others
+            if r.can_exit() and r.identity not in self._duplicate_exit_ids
+        ]
         return random.choice(exits) if exits else None
 
     def _pick_middle(self, entry: RelayInfo, exit_relay: RelayInfo) -> RelayInfo | None:
@@ -616,21 +721,27 @@ class DirectPool:
             results = await asyncio.gather(*tasks, return_exceptions=True)
             built = sum(1 for r in results if not isinstance(r, BaseException))
             failed = sum(1 for r in results if isinstance(r, BaseException))
+            observed_ips = {
+                getattr(circuit, "_exit_ip", None)
+                for circuit in self.circuits
+                if getattr(circuit, "_exit_ip", None)
+            }
             log.info(
-                "Batch: +%d circuits, %d failed (%d/%d total, %d unique exit IPs)",
+                "Batch: +%d circuits, %d failed (%d/%d total, %d observed exit IPs)",
                 built,
                 failed,
                 len(self.circuits),
                 total,
-                len(self._used_ips),
+                len(observed_ips),
             )
             stalled_rounds = stalled_rounds + 1 if built == 0 else 0
 
         log.info(
-            "Built %d/%d pooled circuits (%d unique exit IPs)",
+            "Built %d/%d pooled circuits (%d observed exit IPs, %d duplicate relays rejected)",
             len(self.circuits),
             self.num_circuits,
-            len(self._used_ips),
+            len(self._observed_exits),
+            len(self._duplicate_exit_ids),
         )
         if not self.circuits:
             raise RuntimeError("Failed to build any circuits")
@@ -639,6 +750,7 @@ class DirectPool:
         conn: TorConnection | None = None
         ex: RelayInfo | None = None
         middle: RelayInfo | None = None
+        circ: TorCircuit | None = None
         reserved_exit = False
         try:
             conn = await _open_connection(entry, connect_timeout=5)
@@ -659,6 +771,27 @@ class DirectPool:
             await asyncio.wait_for(circ.build(entry, middle, ex), timeout=25)
             circ._created_at = time.monotonic()
 
+            observed_ip = await probe_exit_ip(circ)
+            if observed_ip is None:
+                raise RuntimeError("Exit IP probe failed")
+            async with self._lock:
+                if not self._observed_exits.claim(observed_ip, ex.identity):
+                    self._duplicate_exit_ids.add(ex.identity)
+                    duplicate = True
+                else:
+                    circ._exit_ip = observed_ip
+                    duplicate = False
+            if duplicate:
+                async with self._lock:
+                    if reserved_exit:
+                        self._release_exit_reservation_locked(ex)
+                        reserved_exit = False
+                await circ.close()
+                await _close_connection(conn)
+                raise DuplicateExitError(
+                    f"Duplicate exit IP {observed_ip} from {ex.nickname}"
+                )
+
             async with self._lock:
                 self.connections.append(conn)
                 self.circuits.append(circ)
@@ -668,13 +801,17 @@ class DirectPool:
                 entry.nickname,
                 middle.nickname,
                 ex.nickname,
-                ex.ip,
+                observed_ip,
             )
+        except DuplicateExitError:
+            raise
         except (Exception, asyncio.CancelledError):
             if ex is not None and reserved_exit:
                 async with self._lock:
                     self._release_exit_reservation_locked(ex)
             self._mark_build_failed(entry, middle, ex)
+            if circ is not None:
+                await circ.close()
             await _close_connection(conn)
             raise
 
@@ -732,28 +869,24 @@ class DirectPool:
         ):
             return False
 
-        for req_data, host, port in self.HEALTH_CHECKS:
-            try:
-                resp = await asyncio.wait_for(
-                    circ.http_request(host, port, req_data), timeout=4
-                )
-                if is_healthy_response(resp):
-                    circ._502_count = 0
-                    circ._health_fails = 0
-                    try:
-                        body = resp.split(b"\r\n\r\n", 1)[1]
-                        data = json.loads(body)
-                        ip = data.get("origin", "")
-                        if ip:
-                            circ._exit_ip = ip
-                    except Exception:
-                        pass
-                    return True
-            except Exception:
-                continue
-
-        circ._health_fails = getattr(circ, "_health_fails", 0) + 1
-        return False
+        observed_ip = await probe_exit_ip(circ, timeout=10.0)
+        if observed_ip is None:
+            circ._health_fails = getattr(circ, "_health_fails", 0) + 1
+            return False
+        identity = circ.exit_info.identity if circ.exit_info else b""
+        previous_exit_ip = getattr(circ, "_exit_ip", None)
+        async with self._lock:
+            if not self._observed_exits.claim(
+                observed_ip,
+                identity,
+                previous_exit_ip=previous_exit_ip,
+            ):
+                circ._health_fails = getattr(circ, "_health_fails", 0) + 1
+                return False
+        circ._exit_ip = observed_ip
+        circ._502_count = 0
+        circ._health_fails = 0
+        return True
 
     async def _rebuild_circuit(
         self, idx: int, old_circ: TorCircuit, old_conn: TorConnection
@@ -819,6 +952,33 @@ class DirectPool:
             await _close_connection(conn)
             return False
 
+        observed_ip = await probe_exit_ip(circ)
+        if observed_ip is None:
+            async with self._lock:
+                if ex.identity != old_exit.identity:
+                    self._release_exit_reservation_locked(ex)
+            self._mark_build_failed(entry, middle, ex)
+            await circ.close()
+            await _close_connection(conn)
+            return False
+        old_exit_ip = getattr(old_circ, "_exit_ip", None)
+        async with self._lock:
+            claimed = self._observed_exits.claim(
+                observed_ip,
+                ex.identity,
+                previous_exit_ip=old_exit_ip,
+            )
+            if not claimed:
+                self._duplicate_exit_ids.add(ex.identity)
+        if not claimed:
+            async with self._lock:
+                if ex.identity != old_exit.identity:
+                    self._release_exit_reservation_locked(ex)
+            await circ.close()
+            await _close_connection(conn)
+            return False
+        circ._exit_ip = observed_ip
+
         async with self._lock:
             if old_exit is not None and ex.identity != old_exit.identity:
                 self._release_exit_reservation_locked(old_exit)
@@ -838,7 +998,7 @@ class DirectPool:
             entry.nickname,
             middle.nickname,
             ex.nickname,
-            ex.ip,
+            observed_ip,
         )
         return True
 
@@ -879,7 +1039,9 @@ class DirectPool:
             new_exit_ips = {
                 relay.ip
                 for relay in new_relays
-                if relay.can_exit() and relay.ip not in self._used_ips
+                if relay.can_exit()
+                and relay.identity not in self._duplicate_exit_ids
+                and relay.ip not in self._used_ips
             }
             room = max(0, self.num_circuits - len(self.circuits))
             can_add = min(len(new_exit_ips), 100, room)
@@ -1036,6 +1198,26 @@ class DirectPool:
                     raise
                 return False
 
+            observed_ip = await probe_exit_ip(circ)
+            if observed_ip is None:
+                async with self._lock:
+                    self._release_exit_reservation_locked(ex)
+                self._mark_build_failed(entry, middle, ex)
+                await circ.close()
+                await _close_connection(conn)
+                return False
+            async with self._lock:
+                claimed = self._observed_exits.claim(observed_ip, ex.identity)
+                if not claimed:
+                    self._duplicate_exit_ids.add(ex.identity)
+            if not claimed:
+                async with self._lock:
+                    self._release_exit_reservation_locked(ex)
+                await circ.close()
+                await _close_connection(conn)
+                return False
+            circ._exit_ip = observed_ip
+
             async with self._lock:
                 self.circuits.append(circ)
                 self.connections.append(conn)
@@ -1048,17 +1230,25 @@ class DirectPool:
             if c.conn and c.conn.writer and not c.conn.writer.is_closing()
         )
         exit_infos = [c.exit_info for c in self.circuits if c.exit_info]
-        exit_ips = [info.ip for info in exit_infos]
+        relay_ips = [info.ip for info in exit_infos]
         exit_ids = [info.identity for info in exit_infos]
+        observed_ips = [
+            c._exit_ip for c in self.circuits if getattr(c, "_exit_ip", None)
+        ]
         return {
             "total": len(self.circuits),
             "alive": alive,
-            "unique_ips": len(set(exit_ips)),
+            "unique_ips": len(set(observed_ips)),
             "reserved_ips": len(self._used_ips),
-            "circuit_unique_ips": len(set(exit_ips)),
+            "observed_ips": len(observed_ips),
+            "unverified_exits": len(self.circuits) - len(observed_ips),
+            "duplicate_observed_ips": len(observed_ips) - len(set(observed_ips)),
+            "duplicate_exit_relays": len(self._duplicate_exit_ids),
+            "relay_unique_ips": len(set(relay_ips)),
+            "circuit_unique_ips": len(set(relay_ips)),
             "circuit_unique_ids": len(set(exit_ids)),
             "missing_exit_info": len(self.circuits) - len(exit_infos),
-            "duplicate_exit_ips": len(exit_ips) - len(set(exit_ips)),
+            "duplicate_exit_ips": len(relay_ips) - len(set(relay_ips)),
             "duplicate_exit_ids": len(exit_ids) - len(set(exit_ids)),
             "dead_entries": len(self._dead_until),
             "rebuilding": len(self._rebuilding),

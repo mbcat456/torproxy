@@ -67,6 +67,8 @@ Optionally create a `config.json` in the folder you run torproxy from (your curr
 
 Set `num_circuits` to 0 to build one circuit per available unique exit IP. All config values can be overridden by CLI arguments. Run `python -m torproxy --help` for the full list.
 
+Each circuit is verified against `checkip.amazonaws.com` after construction. If two circuits expose the same public exit IP, the duplicate circuit is discarded and rebuilt with another exit. The requested circuit count is therefore capped by the number of unique exit IPs Tor actually exposes at that time.
+
 ### Command line arguments
 
 | Flag | Default | Description |
