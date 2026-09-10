@@ -22,6 +22,7 @@ RESET = ESC + "[0m"
 BOLD = ESC + "[1m"
 DIM = ESC + "[2m"
 CLEAR = ESC + "[2J" + ESC + "[3J" + ESC + "[H"
+CLEAR_LINE = ESC + "[2K"
 HIDE_CURSOR = ESC + "[?25l"
 SHOW_CURSOR = ESC + "[?25h"
 
@@ -226,6 +227,10 @@ def visible_length(text: str) -> int:
 def center(text: str, width: int) -> str:
     padding = max(0, (width - visible_length(text)) // 2)
     return " " * padding + text
+
+
+def write_centered_row(row: int, text: str, width: int) -> None:
+    sys.stdout.write(move(row, 0) + CLEAR_LINE + center(text, width))
 
 
 def cpu_name() -> str:
@@ -690,7 +695,7 @@ def fallback_download_path(filename: str) -> str:
 
 async def choose_generation_mode(height: int, width: int) -> str | None:
     prompt = f"{gray('[R]')} Rotating (new IP each request)    {gray('[S]')} Sticky (same IP per session)"
-    sys.stdout.write(move(height // 2, 0) + center(prompt, width))
+    write_centered_row(height // 2, prompt, width)
     sys.stdout.flush()
     while True:
         key = await read_key()
@@ -700,8 +705,8 @@ async def choose_generation_mode(height: int, width: int) -> str | None:
 
 async def choose_ttl(height: int, width: int) -> int | None:
     prompt = f"{gray('Session TTL in minutes? [30] (0 = unlimited)')}"
-    sys.stdout.write(move(height // 2 + 1, 0) + center(prompt, width))
-    sys.stdout.write(move(height // 2 + 2, 0) + "\033[2K")
+    write_centered_row(height // 2 + 1, prompt, width)
+    write_centered_row(height // 2 + 2, "", width)
     sys.stdout.flush()
     raw_value = ""
     while True:
@@ -715,17 +720,15 @@ async def choose_ttl(height: int, width: int) -> int | None:
         elif isinstance(key, str) and key.isdigit():
             raw_value += key
         displayed = raw_value or "30"
-        sys.stdout.write(
-            move(height // 2 + 2, 0) + "\033[2K" + center(displayed, width)
-        )
+        write_centered_row(height // 2 + 2, displayed, width)
         sys.stdout.flush()
 
 
 async def choose_count(height: int, width: int, sticky: bool) -> int | None:
     prompt = f"{gray('How many? [100]')}"
     row = height // 2 + (3 if sticky else 1)
-    sys.stdout.write(move(row, 0) + center(prompt, width))
-    sys.stdout.write(move(row + 1, 0) + "\033[2K")
+    write_centered_row(row, prompt, width)
+    write_centered_row(row + 1, "", width)
     sys.stdout.flush()
     raw_value = ""
     while True:
@@ -739,7 +742,7 @@ async def choose_count(height: int, width: int, sticky: bool) -> int | None:
         elif isinstance(key, str) and key.isdigit():
             raw_value += key
         displayed = raw_value or "100"
-        sys.stdout.write(move(row + 1, 0) + "\033[2K" + center(displayed, width))
+        write_centered_row(row + 1, displayed, width)
         sys.stdout.flush()
 
 
@@ -1008,7 +1011,7 @@ async def confirm_shutdown(
         f"{yellow(question)}  {dark('[Y]')} Stop   {dark('[N]')} {background_label}   "
         f"{dark('[Esc]')} Cancel"
     )
-    sys.stdout.write(move(height // 2, 0) + center(prompt, width))
+    write_centered_row(height // 2, prompt, width)
     sys.stdout.flush()
     for _ in range(8):
         key = await read_key()
