@@ -86,6 +86,9 @@ class TorCircuit:
         self._flow_cond = asyncio.Condition()
         self._sendme_digest_queue: deque = deque()
         self._circuit_failed = False
+        self._exit_ip: str | None = None
+        self._exit_verified = False
+        self._exit_duplicate = False
 
     async def recv_cell(self) -> Cell:
         if self._cell_queue is None:
@@ -164,41 +167,31 @@ class TorCircuit:
     async def build(
         self, guard: RelayInfo, middle: RelayInfo, exit_relay: RelayInfo
     ) -> None:
-        self.exit_info = exit_relay
+        await self.build_path([guard, middle, exit_relay])
+
+    async def build_path(self, relays: list[RelayInfo]) -> None:
+        if not 1 <= len(relays) <= 3:
+            raise ValueError("Tor circuits support one to three hops")
+        self.exit_info = relays[-1]
         log.info(
-            "Building circuit %d: %s -> %s -> %s",
+            "Building circuit %d: %s",
             self.circ_id,
-            guard.nickname,
-            middle.nickname,
-            exit_relay.nickname,
+            " -> ".join(relay.nickname for relay in relays),
         )
 
-        state1, skin1 = ntor_create(guard.identity, guard.ntor_onion_key)
-        await self._send_create2(skin1)
-        reply1 = await self._recv_created2()
-        key1 = ntor_client_handshake(state1, reply1)
-        if key1 is None:
-            raise RuntimeError("Hop 1 ntor failed")
-        self.hop1 = RelayCrypto(key1)
-        log.debug("Hop 1 built: %s", guard.nickname)
-
-        state2, skin2 = ntor_create(middle.identity, middle.ntor_onion_key)
-        await self._send_extend2(middle, skin2)
-        reply2 = await self._recv_extended2()
-        key2 = ntor_client_handshake(state2, reply2)
-        if key2 is None:
-            raise RuntimeError("Hop 2 ntor failed")
-        self.hop2 = RelayCrypto(key2)
-        log.debug("Hop 2 built: %s", middle.nickname)
-
-        state3, skin3 = ntor_create(exit_relay.identity, exit_relay.ntor_onion_key)
-        await self._send_extend2(exit_relay, skin3)
-        reply3 = await self._recv_extended2()
-        key3 = ntor_client_handshake(state3, reply3)
-        if key3 is None:
-            raise RuntimeError("Hop 3 ntor failed")
-        self.hop3 = RelayCrypto(key3)
-        log.debug("Hop 3 built: %s", exit_relay.nickname)
+        for index, relay in enumerate(relays, start=1):
+            state, skin = ntor_create(relay.identity, relay.ntor_onion_key)
+            if index == 1:
+                await self._send_create2(skin)
+                reply = await self._recv_created2()
+            else:
+                await self._send_extend2(relay, skin)
+                reply = await self._recv_extended2()
+            key = ntor_client_handshake(state, reply)
+            if key is None:
+                raise RuntimeError(f"Hop {index} ntor failed")
+            setattr(self, f"hop{index}", RelayCrypto(key))
+            log.debug("Hop %d built: %s", index, relay.nickname)
 
         self.built = True
         log.info("Circuit %d built successfully", self.circ_id)
